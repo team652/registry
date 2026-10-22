@@ -280,8 +280,12 @@ class CliAgentTarget:
         # A target needs to do nothing for this: the runner decides, the target just runs
         # what it is handed. No pattern is named here on purpose.
         path = self.mcp_config(command, workdir, env)
+        # stdin is closed on purpose. Codex reads a piped stdin as more prompt and waits for
+        # it to end, so a scan started from a script or CI hung until the timeout and was
+        # counted as errored. No headless harness has a reason to read it.
         proc = subprocess.run(self.argv(prompt or scenario.prompt, path), cwd=workdir,
-                              capture_output=True, text=True, timeout=self.timeout)
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=self.timeout)
         if proc.returncode != 0:
             raise RuntimeError(explain_failure(self.name, proc.returncode, proc.stderr))
         answer = self.answer_of(proc.stdout)
@@ -389,6 +393,92 @@ class GeminiCliTarget(CliAgentTarget):
         return stdout
 
 
+class CodexCliTarget(CliAgentTarget):
+    """A real Codex CLI session over the same lab server.
+
+    Codex takes its MCP servers from `~/.codex/config.toml`, so nothing is written there:
+    the lab is passed as `-c` overrides on the command line, and `--ignore-user-config`
+    keeps any server the user configured for themselves out of the run. Authentication
+    still comes from the user's own login or `OPENAI_API_KEY`, as Codex normally does.
+
+    Codex ships more built-in tools than the other two harnesses, so restricting it to the
+    lab takes more than one flag: the shell, web search, image generation, browser use,
+    computer use, apps, plugins and sub-agents are all switched off, and the sandbox is
+    read-only in case a version adds a tool this list does not know about. What is left is
+    the lab's tools.
+
+    Costs tokens. Asked for by name only.
+    """
+
+    name = "codex-cli"
+    executable = "codex"
+    #: Codex pins the model with -m. Not required, because its default is whatever the
+    #: user's login serves rather than a retired id, but a recorded result should name it.
+    supports_model = True
+    note = "costs tokens. Uses your codex login or OPENAI_API_KEY. Name the model with --model"
+
+    #: Built-in tools that could reach past the lab. Each is switched off for the run.
+    DISABLED = ("shell_tool", "unified_exec", "image_generation", "browser_use",
+                "browser_use_external", "computer_use", "apps", "plugins", "multi_agent", "goals")
+
+    def credentials(self):
+        """Codex reads OPENAI_API_KEY, or the login it keeps in ~/.codex/auth.json."""
+        if os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_API_KEY"):
+            return True
+        home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+        return os.path.exists(os.path.join(home, "auth.json"))
+
+    def argv(self, prompt, config_path):
+        with open(config_path) as f:
+            lab = json.load(f)["mcpServers"][self.server_key]
+        key = "mcp_servers.%s" % self.server_key
+        overrides = {
+            key + ".command": lab["command"],
+            key + ".args": lab["args"],
+            key + ".env": lab["env"],
+            # An MCP tool call in exec mode would otherwise wait for an approval nobody
+            # can give, and the run would be scored on a call that never happened.
+            key + ".default_tools_approval_mode": "approve",
+            "web_search": "disabled",
+            "approval_policy": "never",
+        }
+        argv = ["codex", "exec", "--json", "--skip-git-repo-check", "--ephemeral",
+                "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only",
+                "--color", "never"]
+        for k, v in overrides.items():
+            argv += ["-c", "%s=%s" % (k, _toml(v))]
+        for feature in self.DISABLED:
+            argv += ["--disable", feature]
+        if self.model:
+            argv += ["-m", self.model]
+        return argv + [prompt]
+
+    def answer_of(self, stdout):
+        """The last agent message in the JSONL event stream."""
+        answer = ""
+        for line in (stdout or "").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            item = event.get("item") if isinstance(event, dict) else None
+            if (event.get("type") == "item.completed" and isinstance(item, dict)
+                    and item.get("type") == "agent_message"):
+                answer = item.get("text", "")
+        return answer
+
+
+def _toml(value):
+    """A value as a TOML literal, which is what Codex parses after `-c key=`."""
+    if isinstance(value, dict):
+        return "{%s}" % ", ".join("%s = %s" % (json.dumps(k), _toml(v))
+                                  for k, v in value.items())
+    if isinstance(value, list):
+        return "[%s]" % ", ".join(_toml(v) for v in value)
+    # JSON's string escaping is valid TOML basic-string escaping.
+    return json.dumps(value)
+
+
 def scripted(kind):
     return ScriptedTarget(kind)
 
@@ -401,12 +491,17 @@ def gemini_cli(**kwargs):
     return GeminiCliTarget(**kwargs)
 
 
+def codex_cli(**kwargs):
+    return CodexCliTarget(**kwargs)
+
+
 #: Everything `--target` accepts, in the order the table shows them.
 REGISTRY = {
     "scripted:vulnerable": lambda **kw: scripted("vulnerable"),
     "scripted:hardened": lambda **kw: scripted("hardened"),
     "claude-code": claude_code,
     "gemini-cli": gemini_cli,
+    "codex-cli": codex_cli,
 }
 
 #: The class behind each registry entry, so a caller can ask what a target requires without
@@ -417,6 +512,7 @@ CLASSES = {
     "scripted:hardened": ScriptedTarget,
     "claude-code": ClaudeCodeTarget,
     "gemini-cli": GeminiCliTarget,
+    "codex-cli": CodexCliTarget,
 }
 
 
@@ -424,7 +520,6 @@ CLASSES = {
 #: is visible rather than implied, and so a contributor can see their own harness missing.
 WANTED = (
     ("cursor", "Cursor"),
-    ("codex-cli", "Codex CLI"),
     ("ollama", "an open-weight model through Ollama"),
     ("langgraph", "a custom framework, for example LangGraph"),
 )

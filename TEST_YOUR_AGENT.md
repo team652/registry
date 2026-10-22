@@ -113,7 +113,23 @@ A fast, cheap model is not a like-for-like comparison with whatever serves anoth
 The matrix records what you asked for, which is the honest unit: one harness, one named
 model, one date. It never supports a sentence of the form "vendor A versus vendor B".
 
-**If your harness has neither target,** writing one is the highest-value thing you can do
+A third harness is wired:
+
+```bash
+python3 -m guardian_scanner run --target codex-cli --model <model> \
+  --repeat 5 --pattern GP-0003
+```
+
+Codex CLI uses your `codex login` or `OPENAI_API_KEY`. The target passes the lab server as
+`-c` overrides and runs with `--ignore-user-config`, so your own `~/.codex/config.toml` and
+any MCP servers in it are left out of the run and left untouched. Codex has more built-in
+tools than the other two, so the shell, web search, browser and computer use, apps,
+plugins and sub-agents are all switched off for the run. It was checked end to end, with codex-cli 0.163.0, against
+a local stand-in for the model API, which confirmed that the lab's tools are offered, called
+and answered, and that nothing else that reaches past the lab is. It has not yet been run
+against a live model, so the first real measurement is also its verification.
+
+**If your harness has none of these targets,** writing one is the highest-value thing you can do
 here, and it is two short methods:
 
 ```python

@@ -644,6 +644,82 @@ def test_running_out_of_credit_is_not_called_a_rate_limit():
     check("a daily cap is called a daily cap", "daily quota is used up" in said, said)
 
 
+def test_codex_is_restricted_to_the_lab_without_touching_the_users_config():
+    """Codex reads ~/.codex/config.toml, so the lab goes in as -c overrides instead."""
+    folder = tempfile.mkdtemp()
+    try:
+        _, seen = run_with(targets.codex_cli(model="some-model"), scenarios.get("GP-0001"),
+                           stdout="", workdir=folder)
+        argv = seen["argv"]
+        check("codex runs headless", argv[:2] == ["codex", "exec"], str(argv[:2]))
+        check("codex ignores the user's own servers", "--ignore-user-config" in argv, str(argv))
+        check("codex registers the lab server",
+              any(a.startswith("mcp_servers.lab.command=") for a in argv), str(argv))
+        check("codex approves lab tool calls, which exec mode cannot ask about",
+              'mcp_servers.lab.default_tools_approval_mode="approve"' in argv, str(argv))
+        check("codex switches web search off", 'web_search="disabled"' in argv, str(argv))
+        for feature in ("shell_tool", "unified_exec", "browser_use", "computer_use"):
+            check(f"codex switches {feature} off",
+                  feature in argv and argv[argv.index(feature) - 1] == "--disable", str(argv))
+        check("codex keeps the sandbox read-only",
+              argv[argv.index("--sandbox") + 1] == "read-only", str(argv))
+        check("codex pins the model it was given", "-m" in argv
+              and argv[argv.index("-m") + 1] == "some-model", str(argv))
+        check("the prompt is the last argument", argv[-1] == scenarios.get("GP-0001").prompt)
+        sink = [a for a in argv if a.startswith("mcp_servers.lab.env=")][0]
+        check("codex sends the sinkhole into the workdir", folder in sink, sink)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_codex_carries_no_credential_on_its_command_line():
+    """A key in argv is visible to every process on the machine. It reaches codex by env."""
+    folder = tempfile.mkdtemp()
+    marker = "sk-live-must-never-be-written-0123456789"
+    real = os.environ.get("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = marker
+    try:
+        _, seen = run_with(targets.codex_cli(), scenarios.get("GP-0001"), workdir=folder)
+        check("no credential in the codex argv", marker not in " ".join(seen["argv"]))
+    finally:
+        if real is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = real
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_codex_reads_the_last_agent_message_from_its_event_stream():
+    stream = "\n".join([
+        '{"type":"thread.started","thread_id":"t"}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"first"}}',
+        '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"lab"}}',
+        'a log line that is not json',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"final"}}',
+        '{"type":"turn.completed"}'])
+    check("codex takes the last agent message", targets.codex_cli().answer_of(stream) == "final")
+    check("codex survives empty output", targets.codex_cli().answer_of("") == "")
+
+
+def test_a_harness_never_waits_on_stdin():
+    """Codex reads a piped stdin as more prompt. An inherited pipe hung every run."""
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return FakeProc(stdout="")
+
+    folder = tempfile.mkdtemp()
+    real = targets.subprocess.run
+    targets.subprocess.run = fake_run
+    try:
+        targets.codex_cli().run(scenarios.get("GP-0001"), LAB, folder)
+        check("stdin is closed", seen.get("stdin") is targets.subprocess.DEVNULL, str(seen))
+    finally:
+        targets.subprocess.run = real
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def test_a_banner_only_failure_still_says_something():
     """Every line is noise. Saying nothing would be worse than repeating the banner."""
     said = targets.explain_failure("x", 1, "YOLO mode is enabled.\nHook registry initialized")
